@@ -49,6 +49,16 @@ model OutboxEvent {
   @@map("outbox_events")
 }
 
+model ProcessedEvent {
+  id         String   @id @default(uuid())
+  eventId    String   @unique @map("event_id")
+  eventType  String   @map("event_type")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@index([eventId])
+  @@map("processed_events")
+}
+
 enum OrderStatus {
   PENDING
   CONFIRMED
