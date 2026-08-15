@@ -1,7 +1,7 @@
 import type { Channel } from 'amqplib';
 import { prisma } from '../config/database.js';
 import { logger } from '../config/logger.js';
-import { getRabbitMQChannel } from '../config/rabbitmq.js';
+import { createChannel } from '../config/rabbitmq.js';
 
 const POLL_INTERVAL_MS = 5000;
 const BATCH_SIZE = 10;
@@ -19,7 +19,6 @@ interface OutboxEventRow {
 }
 
 function getBackoffDelay(attempts: number): number {
-  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
   return Math.min(1000 * Math.pow(2, attempts), 30000);
 }
 
@@ -29,10 +28,9 @@ export async function startOutboxPublisher(): Promise<void> {
 
   while (isRunning) {
     try {
-      const channel = await getRabbitMQChannel();
+      const channel = await createChannel();
       await channel.assertExchange('order.events', 'topic', { durable: true });
 
-      // Inner loop: keep polling while connected
       while (isRunning) {
         try {
           await pollAndPublish(channel);
@@ -55,23 +53,6 @@ export function stopOutboxPublisher(): void {
 }
 
 async function pollAndPublish(channel: Channel): Promise<void> {
-  //
-  // STEP 1: Claim pending events using row-level locking.
-  //
-  // SELECT ... FOR UPDATE SKIP LOCKED:
-  //   - FOR UPDATE: locks the selected rows so no other transaction can modify them.
-  //   - SKIP LOCKED: if another publisher instance already locked these rows,
-  //     this query skips them and grabs the next available rows.
-  //
-  // Why not hold the lock during publishing?
-  //   Publishing to RabbitMQ is a network call. Holding a database lock
-  //   during network I/O would block other publishers and hurt throughput.
-  //   We claim the rows, commit immediately (releasing locks), then publish.
-  //
-  // Tradeoff: a rare race condition where two publishers claim overlapping
-  // events is possible if one publisher is very slow. This is acceptable
-  // because we guarantee at-least-once delivery, and consumers are idempotent.
-  //
   const events = await prisma.$transaction(async (tx) => {
     const rows = await tx.$queryRaw<OutboxEventRow[]>`
       SELECT
@@ -97,15 +78,6 @@ async function pollAndPublish(channel: Channel): Promise<void> {
 
   logger.debug({ count: events.length }, 'Claimed outbox events for publishing');
 
-  //
-  // STEP 2: Publish each event to RabbitMQ.
-  //
-  // We publish OUTSIDE the database transaction to avoid holding row locks
-  // during network I/O. If publishing succeeds, we update the row status.
-  // If the process crashes after publishing but before updating, the event
-  // remains PENDING and will be republished on the next poll cycle.
-  // This creates duplicate messages, which idempotent consumers handle.
-  //
   for (const event of events) {
     try {
       const messageBuffer = Buffer.from(
@@ -131,13 +103,6 @@ async function pollAndPublish(channel: Channel): Promise<void> {
         throw new Error('RabbitMQ channel write buffer full');
       }
 
-      //
-      // STEP 3: Mark as published.
-      //
-      // Only update status AFTER successful publish. If this update fails
-      // (e.g., DB connection lost), the event remains PENDING and will be
-      // republished later. This is the at-least-once guarantee.
-      //
       await prisma.outboxEvent.update({
         where: { id: event.id },
         data: {

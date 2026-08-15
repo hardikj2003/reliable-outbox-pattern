@@ -3,45 +3,58 @@ import { env } from './env.js';
 import { logger } from './logger.js';
 
 let connection: ChannelModel | null = null;
-let channel: Channel | null = null;
+const channels = new Set<Channel>();
 
-export async function getRabbitMQChannel(): Promise<Channel> {
-  if (channel) {
-    return channel;
+async function getConnection(): Promise<ChannelModel> {
+  if (connection) {
+    return connection;
   }
 
   connection = await connect(env.RABBITMQ_URL);
-  channel = await connection.createChannel();
-
   logger.info('RabbitMQ connection established');
 
   connection.on('error', (err: Error) => {
     logger.error({ err }, 'RabbitMQ connection error');
-    channel = null;
     connection = null;
+    channels.clear();
   });
 
   connection.on('close', () => {
     logger.warn('RabbitMQ connection closed');
-    channel = null;
     connection = null;
+    channels.clear();
+  });
+
+  return connection;
+}
+
+export async function createChannel(): Promise<Channel> {
+  const conn = await getConnection();
+  const channel = await conn.createChannel();
+  channels.add(channel);
+
+  channel.on('close', () => {
+    channels.delete(channel);
+  });
+
+  channel.on('error', (err: Error) => {
+    logger.error({ err }, 'RabbitMQ channel error');
+    channels.delete(channel);
   });
 
   return channel;
 }
-
 export async function closeRabbitMQ(): Promise<void> {
   try {
-    if (channel) {
-      await channel.close();
-      channel = null;
+    for (const ch of channels) {
+      await ch.close();
     }
+    channels.clear();
 
     if (connection) {
       await connection.close();
       connection = null;
     }
-
     logger.info('RabbitMQ connection closed');
   } catch (err) {
     logger.error({ err }, 'Error closing RabbitMQ connection');
